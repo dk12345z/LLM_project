@@ -1,0 +1,213 @@
+from __future__ import annotations
+
+import os
+from copy import deepcopy
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+from dotenv import load_dotenv
+from fastapi import FastAPI, Form, HTTPException
+from fastapi.responses import HTMLResponse, JSONResponse
+from pydantic import BaseModel, Field
+
+try:
+    from openai import OpenAI
+except ImportError:  # pragma: no cover
+    OpenAI = None
+
+try:
+    import google.generativeai as genai
+except ImportError:  # pragma: no cover
+    genai = None
+
+load_dotenv()
+
+SYSTEM_PROMPT = (
+    "You are a helpful, concise, and professional assistant. "
+    "Your role is to answer the user's questions clearly and usefully. "
+    "Keep tone friendly, correct, and practical. "
+    "If you do not know the answer, say so plainly and avoid guessing."
+)
+
+MAX_HISTORY_MESSAGES = int(os.getenv("MAX_HISTORY_MESSAGES", "8"))
+CONVERSATIONS: Dict[str, Dict[str, Any]] = {}
+
+
+class ChatMessage(BaseModel):
+    role: str
+    content: str
+
+
+class ChatRequest(BaseModel):
+    conversation_id: str = Field(default="default")
+    message: str = Field(..., min_length=1)
+    history: Optional[List[ChatMessage]] = None
+
+
+class ChatResponse(BaseModel):
+    conversation_id: str
+    reply: str
+    history: List[ChatMessage]
+    summary: Optional[str] = None
+
+
+app = FastAPI(title="LLM API Integration", version="1.0.0")
+
+
+def _get_conversation(conversation_id: str) -> Dict[str, Any]:
+    if conversation_id not in CONVERSATIONS:
+        CONVERSATIONS[conversation_id] = {"history": [], "summary": None}
+    return CONVERSATIONS[conversation_id]
+
+
+def _summarize_messages(messages: List[ChatMessage]) -> str:
+    if not messages:
+        return "No earlier context."
+
+    summary_text = "\n".join(f"{msg.role}: {msg.content}" for msg in messages)
+    if len(summary_text) <= 500:
+        return summary_text.strip()
+
+    truncated = summary_text[:500].rsplit(" ", 1)[0]
+    return truncated.strip() + "..."
+
+
+def _manage_context(history: List[ChatMessage]) -> tuple[List[ChatMessage], Optional[str]]:
+    if len(history) <= MAX_HISTORY_MESSAGES:
+        return history, None
+
+    overflow = history[:-MAX_HISTORY_MESSAGES]
+    summary = _summarize_messages(overflow)
+    return history[-MAX_HISTORY_MESSAGES:], summary
+
+
+def _build_messages(history: List[ChatMessage], summary: Optional[str]) -> List[Dict[str, str]]:
+    messages: List[Dict[str, str]] = [{"role": "system", "content": SYSTEM_PROMPT}]
+    if summary:
+        messages.append({"role": "user", "content": f"Earlier conversation summary: {summary}"})
+
+    for item in history:
+        role = item.role if item.role in {"user", "assistant"} else "user"
+        messages.append({"role": role, "content": item.content})
+
+    return messages
+
+
+def _offline_reply(message: str) -> str:
+    return (
+        "I am running in offline mode because no LLM API key is configured. "
+        f"Your message was: '{message}'. "
+        "Set OPENAI_API_KEY or GEMINI_API_KEY to enable live model responses."
+    )
+
+
+def _call_openai(messages: List[Dict[str, str]]) -> str:
+    if OpenAI is None:
+        raise RuntimeError("openai package is not installed")
+
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY is missing")
+
+    client = OpenAI(api_key=api_key)
+    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+    completion = client.chat.completions.create(
+        model=model,
+        messages=messages,
+    )
+    return completion.choices[0].message.content.strip()
+
+
+def _call_gemini(messages: List[Dict[str, str]]) -> str:
+    if genai is None:
+        raise RuntimeError("google-generativeai package is not installed")
+
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        raise RuntimeError("GEMINI_API_KEY is missing")
+
+    genai.configure(api_key=api_key)
+    model_name = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+    model = genai.GenerativeModel(model_name=model_name)
+
+    prompt = "\n".join(f"{m['role']}: {m['content']}" for m in messages)
+    response = model.generate_content(prompt)
+    return response.text.strip()
+
+
+def _generate_llm_response(history: List[ChatMessage]) -> tuple[str, Optional[str]]:
+    managed_history, summary = _manage_context(history)
+    messages = _build_messages(managed_history, summary)
+
+    provider = os.getenv("LLM_PROVIDER", "openai").lower()
+    api_key = os.getenv("OPENAI_API_KEY") or os.getenv("GEMINI_API_KEY")
+
+    if not api_key:
+        return _offline_reply(history[-1].content if history else "hello"), summary
+
+    try:
+        if provider == "gemini":
+            return _call_gemini(messages), summary
+        return _call_openai(messages), summary
+    except Exception as exc:  # pragma: no cover - keep it explicit and user-friendly
+        raise HTTPException(
+            status_code=502,
+            detail=f"LLM request failed: {exc}",
+        ) from exc
+
+
+@app.get("/health")
+def health() -> Dict[str, str]:
+    return {"status": "ok"}
+
+
+@app.get("/", response_class=HTMLResponse)
+def index() -> HTMLResponse:
+    html_path = Path(__file__).parent / "static" / "index.html"
+    return HTMLResponse(content=html_path.read_text(encoding="utf-8"))
+
+
+@app.post("/chat")
+@app.post("/api/chat")
+@app.post("/api/v1/chat")
+def chat(payload: ChatRequest) -> ChatResponse:
+    conversation = _get_conversation(payload.conversation_id)
+
+    incoming_history = payload.history or conversation["history"]
+    if not incoming_history:
+        incoming_history = []
+
+    history = [ChatMessage(**item.model_dump()) if hasattr(item, "model_dump") else ChatMessage(**item) for item in incoming_history]
+    new_message = ChatMessage(role="user", content=payload.message)
+    history.append(new_message)
+
+    managed_history, summary = _manage_context(history)
+    conversation["history"] = managed_history
+    conversation["summary"] = summary
+
+    reply, response_summary = _generate_llm_response(managed_history)
+    conversation["history"] = managed_history + [ChatMessage(role="assistant", content=reply)]
+    conversation["summary"] = response_summary or summary
+
+    return ChatResponse(
+        conversation_id=payload.conversation_id,
+        reply=reply,
+        history=conversation["history"],
+        summary=conversation["summary"],
+    )
+
+
+@app.post("/submit")
+def submit_form(
+    conversation_id: str = Form(default="default"),
+    message: str = Form(...),
+) -> JSONResponse:
+    payload = ChatRequest(conversation_id=conversation_id, message=message)
+    response = chat(payload)
+    return JSONResponse(content=response.model_dump())
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(app, host="0.0.0.0", port=8000)
